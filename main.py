@@ -9,17 +9,28 @@ hour by hour, form an empirical predictive distribution for the target's
 remaining hours — but not all comparables deserve an equal vote. Each one
 is weighted by how closely its *pre-release* trajectory (the twelve hours
 before its day began, again as log-ratios to its own hour 1) matches the
-target's pre-release trajectory: launches that were gathering viewers in
-the same pattern before daybreak tend to unfold alike after it. The
-forecast quantile at level tau for hour h is then p1 * exp(weighted
-tau-quantile of the comparable log-ratios at h), so the spread is exactly
-how much similar real launches actually deviated, per hour — honest
-calibration, not fixed padding. One hedge: in the mid-day hours (5–14),
-comparable trajectories diverge the most (unlock timing differs), so
-there the shape forecast is blended halfway toward the persistence
-baseline (flat level, random-walk spread) in log space; the opening dip
-(hours 2–4) and the evening climb (15–24) are consistent enough across
-launches to trust the shape fully.
+target's pre-release trajectory, multiplied by a second Gaussian factor on
+the distance between the comparable's scale (its hour-1 print) and the
+target's: launches of a similar size unfold in similar ratio shapes, and
+pooling a 100k launch with a 1M launch blurs exactly the structure that
+matters. The forecast quantile at level tau for hour h is then
+p1 * exp(weighted tau-quantile of the comparable log-ratios at h), shrunk
+halfway toward the median: the pool's raw tails are wider than any single
+launch's realised deviation, so the outer quantiles are pulled in to match
+how far similar launches actually strayed. Two level corrections follow
+from the target's own pre-release data, each measured against the weighted
+pool average. A growth tilt: if the target's audience was still compounding
+faster than the pool's in the hours before daybreak (the slope of its
+pre-release log curve), the excess growth is extrapolated into the day,
+hour by hour. And a diurnal correction: the target's pre-release days show
+how deep its audience's overnight trough runs (early-UTC versus
+evening-UTC level); a deeper trough than the pool's pulls the night hours
+(2–4 and 9–13) down by a fraction of the difference, a shallower one lifts
+them. One hedge: in the mid-day hours (5–14), comparable trajectories
+diverge the most (unlock timing differs), so there the shape forecast is
+blended halfway toward the persistence baseline (flat level, random-walk
+spread) in log space; the opening dip and the evening climb are consistent
+enough across launches to trust the shape fully.
 
 The grader runs this file once per case (`python3 -P -s /bot/main.py`,
 standard library only, offline). Input/output follow the case contract:
@@ -55,10 +66,24 @@ MIN_COMPARABLES = 5
 # floor every comparable keeps, so no launch is ever fully ignored.
 KERNEL_BANDWIDTH = 0.3
 KERNEL_FLOOR = 0.15
+# Scale kernel: a second Gaussian factor on the distance between a
+# comparable's hour-1 print and the target's (log units). Similar-sized
+# launches share ratio shapes; distant-sized ones are down-weighted.
+SCALE_BANDWIDTH = 0.9
 # Weight for a comparable whose pre-release curve cannot be compared
 # (too few shared hours): a neutral mid value.
 DEFAULT_WEIGHT = 0.65
 PRE_HOURS = 12
+# Spread calibration: non-median shape quantiles are shrunk this far
+# toward the shape median (the pool's raw tails overstate the spread).
+SPREAD_SHRINK = [0.5, 0.5, 1.0, 0.5, 0.5]
+# Growth tilt: the target's pre-release log-slope minus the pool's
+# weighted average slope, extrapolated into the day at this rate.
+TILT_BETA = 0.95
+# Diurnal correction: the target's pre-release overnight-trough depth
+# minus the pool's, applied at this rate in the night hours.
+DIP_GAMMA = 0.18
+DIP_HOURS = frozenset([2, 3, 4, 9, 10, 11, 12, 13])
 # Mid-day hedge: hours 5..14 blend the shape forecast halfway (in log
 # space) toward the persistence baseline; other hours trust it fully.
 MID_DAY_BLEND = 0.5
@@ -104,6 +129,46 @@ def pre_curve(pts, start, log_anchor):
     return out
 
 
+def pre_slope(curve):
+    """Least-squares slope of a pre-release curve, per hour toward daybreak.
+
+    The curve maps hours-before-start to log-ratios; the slope is taken
+    against time running toward the start, so a positive value means the
+    audience was still compounding as the day began. None if the curve
+    has too few points to fit.
+    """
+    if len(curve) < 4:
+        return None
+    xs = [-t for t in sorted(curve)]
+    ys = [curve[t] for t in sorted(curve)]
+    mx = sum(xs) / len(xs)
+    my = sum(ys) / len(ys)
+    den = sum((x - mx) ** 2 for x in xs)
+    if not den:
+        return None
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+
+
+def dip_stat(pts, start):
+    """Overnight-trough depth of the days before a launch.
+
+    Mean log viewers in the early-UTC window (08–13) minus the evening
+    window (17–22), over the four days before `start`: how far the
+    audience falls overnight, a property of where its viewers live.
+    None when either window is too sparsely sampled to trust.
+    """
+    early, evening = [], []
+    for t, v in pts.items():
+        if start - timedelta(days=4) <= t < start:
+            if 8 <= t.hour <= 13:
+                early.append(math.log(v))
+            if 17 <= t.hour <= 22:
+                evening.append(math.log(v))
+    if len(early) >= 8 and len(evening) >= 8:
+        return sum(early) / len(early) - sum(evening) / len(evening)
+    return None
+
+
 def weighted_quantile(pairs, tau):
     """tau-quantile of (value, weight) pairs, linear interpolation.
 
@@ -130,22 +195,29 @@ def weighted_quantile(pairs, tau):
 
 
 def comparable_data(case):
-    """Per comparable: ({hour: log-ratio to its hour 1}, similarity weight).
+    """(hour-1 print, [(ratios, weight)], slope_diff, dip_diff).
 
     The weight compares the comparable's pre-release curve with the
     target's (from the case's history_hourly and known hour 1): a
     Gaussian kernel on the RMS distance over the shared pre-hours, on
-    top of a floor. Comparables without a release-day anchor are dropped;
-    ones whose pre-curve cannot be compared get a neutral weight.
+    top of a floor, multiplied by a Gaussian factor on the distance
+    between the comparable's scale and the target's. Comparables without
+    a release-day anchor are dropped; ones whose pre-curve cannot be
+    compared get a neutral weight. slope_diff / dip_diff are the
+    target's pre-release growth slope / overnight-trough depth minus
+    the weighted pool averages (None when either side is unmeasurable).
     """
     first = next((k for k in case.get("known") or [] if k.get("hour") == 1), None)
     p1 = max(1.0, float(first["viewers"])) if first and first.get("viewers") else 1.0
     try:
         start = parse_ts(case["day_start"])
     except (KeyError, TypeError, ValueError):
-        return p1, []
-    target_pre = pre_curve(points_map(case.get("history_hourly")), start, math.log(p1))
+        return p1, [], None, None
+    target_pts = points_map(case.get("history_hourly"))
+    target_pre = pre_curve(target_pts, start, math.log(p1))
+    target_dip = dip_stat(target_pts, start)
     out = []
+    pool = []  # (weight, pre-curve, dip) per kept comparable, for the diffs
     for comp in case.get("comparables") or []:
         try:
             cs = parse_ts(comp["day_start"])
@@ -167,6 +239,10 @@ def comparable_data(case):
             )
         else:
             weight = DEFAULT_WEIGHT
+        scale_dist = log_anchor - math.log(p1)
+        weight *= math.exp(
+            -(scale_dist * scale_dist) / (2 * SCALE_BANDWIDTH * SCALE_BANDWIDTH)
+        )
         ratios = {}
         for h in range(2, 25):
             v = pts.get(cs + timedelta(hours=h - 1))
@@ -174,25 +250,53 @@ def comparable_data(case):
                 ratios[h] = math.log(v) - log_anchor
         if ratios:
             out.append((ratios, weight))
-    return p1, out
+            pool.append((weight, comp_pre, dip_stat(pts, cs)))
+
+    def weighted_diff(target_stat, stats):
+        num = den = 0.0
+        for w, s in stats:
+            if s is not None:
+                num += w * s
+                den += w
+        if target_stat is None or den <= 0:
+            return None
+        return target_stat - num / den
+
+    slope_diff = weighted_diff(
+        pre_slope(target_pre), [(w, pre_slope(cp)) for w, cp, _ in pool]
+    )
+    dip_diff = weighted_diff(target_dip, [(w, dp) for w, _, dp in pool])
+    return p1, out, slope_diff, dip_diff
 
 
 def forecast_case(case):
-    p1, comps = comparable_data(case)
+    p1, comps, slope_diff, dip_diff = comparable_data(case)
     hours_out = []
     for row in case["forecast"]:
         h = int(row["hour"])
         pairs = [(ratios[h], w) for ratios, w in comps if h in ratios]
         alpha = MID_DAY_BLEND if h in MID_DAY_HOURS else 1.0
-        qs = []
+        shape_logs = []
+        base_logs = []
         for i, tau in enumerate(LEVELS):
             base_log = FALLBACK_Z[i] * FALLBACK_SIGMA * math.sqrt(h - 1)
             if len(pairs) >= MIN_COMPARABLES:
-                shape_log = weighted_quantile(pairs, tau)
+                shape_logs.append(weighted_quantile(pairs, tau))
             else:
-                shape_log = base_log
-            log_q = (1.0 - alpha) * base_log + alpha * shape_log
-            qs.append(round2(p1 * math.exp(log_q)))
+                shape_logs.append(base_log)
+            base_logs.append(base_log)
+        med_shape = shape_logs[2]
+        # Level corrections from the target's own pre-release data.
+        correction = 0.0
+        if slope_diff is not None:
+            correction += TILT_BETA * slope_diff * (h - 1)
+        if dip_diff is not None and h in DIP_HOURS:
+            correction += DIP_GAMMA * dip_diff
+        qs = []
+        for i in range(len(LEVELS)):
+            shrunk = med_shape + SPREAD_SHRINK[i] * (shape_logs[i] - med_shape)
+            log_q = (1.0 - alpha) * base_logs[i] + alpha * shrunk
+            qs.append(round2(p1 * math.exp(log_q + correction)))
         # Guard the contract: positive, finite, non-decreasing.
         fixed = []
         prev = 0.0
